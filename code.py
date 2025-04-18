@@ -1,86 +1,76 @@
 import numpy as np
+import torch
+import torch.nn as nn
 from sklearn.svm import SVC
 from sklearn.model_selection import GridSearchCV
 from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from scipy.signal import butter, filtfilt
 
-# ========== Step 1: Transformer for Feature Extraction ==========
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=500):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-np.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div_term)
-        pe[:, 1::2] = torch.cos(pos * div_term)
-        self.pe = pe.unsqueeze(0)
-
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
-
-class EEGTransformer(nn.Module):
-    def __init__(self, input_dim, d_model=128, nhead=4, num_layers=2):
-        super().__init__()
-        self.project = nn.Linear(input_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=0.1)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pool = nn.AdaptiveAvgPool1d(1)
+# Transformer Block
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim, num_heads, ff_hidden_dim, dropout=0.1):
+        super(TransformerBlock, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ff_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(ff_hidden_dim, embed_dim)
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # x shape: (batch_size, seq_len, channels)
-        x = self.project(x)  # (batch_size, seq_len, d_model)
-        x = self.pos_encoder(x)
-        x = x.permute(1, 0, 2)  # Transformer expects (seq_len, batch_size, d_model)
-        x = self.transformer(x)
-        x = x.permute(1, 2, 0)  # (batch_size, d_model, seq_len)
-        x = self.pool(x).squeeze(-1)  # (batch_size, d_model)
+        attn_output, _ = self.attention(x, x, x)
+        x = self.norm1(x + self.dropout(attn_output))
+        ff_output = self.ffn(x)
+        x = self.norm2(x + self.dropout(ff_output))
         return x
 
-# ========== Step 2: SVM Classifier ==========
+# EEG Transformer Model
+class EEGTransformer(nn.Module):
+    def __init__(self, input_dim, embed_dim, num_heads, ff_hidden_dim, num_layers, max_len=100):
+        super(EEGTransformer, self).__init__()
+        self.linear_proj = nn.Linear(input_dim, embed_dim)
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, embed_dim))
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, ff_hidden_dim)
+            for _ in range(num_layers)
+        ])
+        self.global_avg_pool = nn.AdaptiveAvgPool1d(1)
 
+    def forward(self, x):
+        x = self.linear_proj(x)
+        x = x + self.pos_embedding[:, :x.size(1)]
+        for block in self.transformer_blocks:
+            x = block(x)
+        x = x.permute(0, 2, 1)
+        x = self.global_avg_pool(x).squeeze(-1)
+        return x
+
+# Preprocessing EEG
+def preprocess_eeg(eeg_data, fs=256.0):
+    def bandpass_filter(data, lowcut=0.1, highcut=15.0, fs=256.0, order=4):
+        nyq = 0.5 * fs
+        low = lowcut / nyq
+        high = highcut / nyq
+        b, a = butter(order, [low, high], btype='band')
+        return filtfilt(b, a, data)
+
+    filtered = np.array([[bandpass_filter(ch, fs=fs) for ch in trial.T] for trial in eeg_data])
+    normalized = (filtered - filtered.mean(axis=-1, keepdims=True)) / filtered.std(axis=-1, keepdims=True)
+    return normalized.transpose(0, 2, 1)
+
+# Train SVM
 def train_svm(features, labels):
-    pipeline = Pipeline([
-        ('scaler', StandardScaler()),
-        ('svm', SVC(kernel='rbf'))
-    ])
-    param_grid = {
-        'svm__C': [0.1, 1, 10],
-        'svm__gamma': ['scale', 0.01, 0.001]
-    }
-    grid_search = GridSearchCV(pipeline, param_grid, cv=5)
-    grid_search.fit(features, labels)
-    return grid_search.best_estimator_
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features)
+    parameters = {'C': [0.1, 1, 10], 'gamma': ['scale', 'auto']}
+    clf = GridSearchCV(SVC(kernel='rbf'), parameters)
+    clf.fit(features_scaled, labels)
+    return clf, scaler
 
-# ========== Step 3: Complete Training Pipeline ==========
-
-def extract_transformer_features(model, eeg_data, device='cpu'):
-    model.eval()
-    eeg_tensor = torch.tensor(eeg_data, dtype=torch.float32).to(device)
-    with torch.no_grad():
-        features = model(eeg_tensor).cpu().numpy()
-    return features
-
-# Example Usage
-if __name__ == "__main__":
-    # Simulated data (replace with real EEG data)
-    N, T, C = 100, 200, 14  # N: trials, T: time, C: channels
-    X = np.random.randn(N, T, C)  # EEG data
-    y = np.random.randint(0, 2, N)  # Labels: 0 = non-P300, 1 = P300
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    transformer = EEGTransformer(input_dim=C).to(device)
-
-    # Convert to transformer input format
-    features = extract_transformer_features(transformer, X, device=device)
-
-    # Train SVM
-    svm_model = train_svm(features, y)
-
-    # Predict on the same features (for demonstration)
-    predictions = svm_model.predict(features)
-    print("Sample Predictions:", predictions[:10])
+# Predict SVM
+def predict_svm(clf, scaler, test_features):
+    test_features_scaled = scaler.transform(test_features)
+    return clf.predict(test_features_scaled)
